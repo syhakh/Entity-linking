@@ -1,1 +1,403 @@
+#-*- coding: utf-8 -*-
+# 2020年百度的实体链指比赛（ ccks2020，https://biendata.com/competition/ccks_2019_el/ ），一个superbaseline
 
+import json
+from tqdm import tqdm  # 精度条
+import os
+import numpy as np
+import pandas as pd
+from random import choice  # 随机选择
+from itertools import groupby  # 分组
+import sys
+from keras_bert import load_trained_model_from_checkpoint, Tokenizer
+#from bert4keras.bert import build_bert_model
+import codecs
+
+import win_unicode_console
+win_unicode_console.enable()
+
+# 参数设置
+maxlen = 160
+batch_size = 8
+droup_out_rate = 0.5
+learning_rate = 1e-5
+epochs = 15
+
+mode = 0
+min_count = 2 # 最小的字出现频率
+char_size = 768 # 每个字的维度
+# 添加bert模型自动提取特征
+
+config_path = "chinese_L-12_H-768_A-12/bert_config.json"
+checkpoint_path = "chinese_L-12_H-768_A-12/bert_model.ckpt"
+dict_path = "chinese_L-12_H-768_A-12/vocab.txt"
+
+token_dict={}
+
+with codecs.open(dict_path, 'r', 'utf8') as reader:
+    for line in reader:
+        token = line.strip()
+        token_dict[token] = len(token_dict)
+
+class OurTokenizer(Tokenizer):
+    def _tokenize(self, text):
+        R = []
+        for c in text:
+            if c in self._token_dict:
+                R.append(c)
+            elif self._is_space(c):
+                R.append('[unused1]') # space类用未经训练的[unused1]表示
+            else:
+                R.append('[UNK]') # 剩余的字符是[UNK]
+        return R
+
+tokenizer = OurTokenizer(token_dict)
+
+id2kb = {}  # id 对应知识库
+with open('ccks2020_el2/kb.json','r',encoding='utf-8') as f:
+    for l in tqdm(f):
+        _ = json.loads(l,strict = False)
+        subject_id = _['subject_id']
+        #print('subject_id is', subject_id)
+        subject_alias = list(set([_['subject']] + _.get('alias', [])))  # [subject(去重)+alias]
+        subject_alias = [alias.lower() for alias in subject_alias]  # 全部小写
+        #print('subject_alias is', subject_alias)
+        subject_desc = '\n'.join(u'%s：%s' % (i['predicate'], i['object']) for i in _['data']) # subject 描述文本（perdicate + object）
+        subject_desc = subject_desc.lower()  # 实体描述文本小写
+        #print('subject_dec is', subject_desc)
+        if subject_desc: # 全部为正
+            id2kb[subject_id] = {'subject_alias': subject_alias, 'subject_desc': subject_desc}
+            # 创建id2kb列表，列表中包含词典[[{}],[{]],[{}],[{}]]
+
+
+kb2id = {}  # 知识库对应编号？？？？
+for i,j in id2kb.items(): # i对应subject_alias, j 对应subject_dec
+    for k in j['subject_alias']:
+        if k not in kb2id:
+            kb2id[k] = [] # 创建空结合
+        kb2id[k].append(i)
+#print('kb2id is ',kb2id)
+
+train_data = []  # 训练数据集合
+with open('ccks2020_el2/train.json','r',encoding='utf-8') as f:
+    for l in tqdm(f):
+        _ = json.loads(l,strict = False)
+        train_data.append({
+            'text': _['text'].lower(),
+            'mention_data': [(x['mention'].lower(), int(x['offset']), x['kb_id'])  # 链指数据
+                for x in _['mention_data'] if x['kb_id'] != 'NIL'
+            ]
+        }) # 列表[{text:全部小写：mention_data：[全部小写。offset],[kb_id]},{},{}]
+
+
+
+# 建议换成BERT
+if not os.path.exists('all_chars_me1.json'): #所有实体的编码汇聚
+    chars = {}
+    for d in tqdm(iter(id2kb.values())):
+        for c in d['subject_desc']:
+            chars[c] = chars.get(c, 0) + 1  #exist +1 else 1  get() 函数返回指定键的值
+    for d in tqdm(iter(train_data)): # 确定字的出现频率
+        for c in d['text']:
+            chars[c] = chars.get(c, 0) + 1
+    chars = {i:j for i,j in chars.items() if j >= min_count}
+    #print('char is ', chars)
+    id2char = {i+2:j for i,j in enumerate(chars)} # 0: mask, 1: padding   +2???
+    #print('id2char is ', id2char)
+    char2id = {j:i for i,j in id2char.items()}
+    with open('all_chars_me1.json', 'w',encoding='utf-8') as j:
+        j.write(json.dumps([id2char, char2id], ensure_ascii=False, indent=4))
+else:
+    id2char, char2id = json.load(open('all_chars_me1.json','r',encoding='utf-8'),strict=False)
+
+
+if not os.path.exists('random_order_train1.json'):  # 随机排序训练数据
+    random_order = list(range(len(train_data)))
+    np.random.shuffle(random_order)  # 随机打乱次序
+    with open('random_order_train1.json', 'w',encoding='utf-8') as j:
+        j.write(json.dumps(random_order, ensure_ascii=False, indent=4))  # ensure_ascii表示的意思是是否要转为ASCII码 indeient 代表缩进4个字符
+    '''json.dumps(
+        random_order,
+        open('random_order_train.json', 'w', encoding='utf-8'),
+        indent=4,
+        ensure_ascii=False
+    )'''
+else:
+    random_order = json.load(open('random_order_train1.json','r',encoding='utf-8'))
+
+
+dev_data = [train_data[j] for i, j in enumerate(random_order) if i % 9 == mode]  # 验证数据集  # 为什么9是可以
+train_data = [train_data[j] for i, j in enumerate(random_order) if i % 9 != mode]  # 训练数据集
+
+
+
+
+
+def seq_padding(X, padding=0):
+    L = [len(x) for x in X]
+    ML = max(L)
+    return np.array([
+        np.concatenate([x, [padding] * (ML - len(x))]) if len(x) < ML else x for x in X
+    ])
+
+
+class data_generator: 
+    def __init__(self, data, batch_size=8):
+        self.data = data # 训练数据
+        self.batch_size = batch_size # 64
+        self.steps = len(self.data) // self.batch_size
+        if len(self.data) % self.batch_size != 0:
+            self.steps += 1
+    def __len__(self): # 返回步长
+        return self.steps
+    def __iter__(self):
+        while True:                #?????
+            idxs = list(range(len(self.data)))  # 标签
+            np.random.shuffle(idxs) # 随机打乱 idxs
+            X1,X3, X2, X4, S1, S2, Y, T = [],[],[], [], [], [], [], []
+            for i in idxs: # 根据出现的随机数据生成训练数据集
+                d = self.data[i]
+                text = d['text'][:maxlen]
+                #text = tokenizer.tokenize(text)
+                #x1 = [char2id.get(c, 1) for c in text] # 获取每个字符对应的数字
+                x1,x3 = tokenizer.encode(first=text)[0]
+                s1, s2 = np.zeros(len(text)), np.zeros(len(text)) #实体左边界实体，右边界
+                mds = {} #？？？？ # 提及数据
+                for md in d['mention_data']:
+                    if md[0] in kb2id:
+                        j1 = md[1]
+                        j2 = j1 + len(md[0]) # 整个实体的长度
+                        s1[j1] = 1 # 确定左实体边界
+                        s2[j2 - 1] = 1 # 确定右边边界
+                        mds[(j1, j2)] = (md[0], md[2]) #？？？？？
+                if mds:
+                    j1, j2 = choice(list(mds.keys())) # 随机选择
+                    y = np.zeros(len(text))
+                    y[j1: j2] = 1
+                    x2 = choice(kb2id[mds[(j1, j2)][0]])
+                    if x2 == mds[(j1, j2)][1]:
+                        t = [1]
+                    else:
+                        t = [0]
+                    x2 = id2kb[x2]['subject_desc']
+                    #x2 = [char2id.get(c, 1) for c in x2]
+                    x2,x4 = tokenizer.encode(first=x2)[0]
+                    X1.append(x1)
+                    X3.appen(x3)
+                    X2.append(x2)
+                    X4.append(x4)
+                    S1.append(s1)
+                    S2.append(s2)
+                    Y.append(y)
+                    T.append(t)
+                    if len(X1) == self.batch_size or i == idxs[-1]:
+                        X1 = seq_padding(X1)
+                        X3 = seq_padding(X3)
+                        X2 = seq_padding(X2)
+                        X4 = seq_padding(X4)
+                        S1 = seq_padding(S1)
+                        S2 = seq_padding(S2)
+                        Y = seq_padding(Y)
+                        T = seq_padding(T)
+                        yield [X1, X2, S1, S2, Y, T], None
+                        X1,X3, X2,X4, S1, S2, Y, T = [],[],[], [], [], [], [], []
+                    #print('X1 is ',X1)
+                    #print('X2 is ',X2)
+                    #print('S1 is ',S1)
+                    #print('S2 is ',S2)
+                    #print('Y is ',Y)
+                    #print('T is ',T)
+
+
+
+
+
+import keras.backend as K
+from keras.callbacks import Callback
+from keras.optimizers import Adam
+from keras.layers import TimeDistributed
+from keras_contrib.layers import CRF
+from keras_contrib.losses import crf_loss
+from keras_contrib.metrics import crf_accuracy, crf_viterbi_accuracy
+from keras.models import Input
+from keras.utils import to_categorical, plot_model
+from seqeval.metrics import classification_report
+from keras.models import Model
+from keras.layers import *
+from bert4keras023.bert import build_bert_model
+from bert4keras023.utils import Tokenizer, load_vocab
+
+def seq_maxpool(x):
+    """seq是[None, seq_len, s_size]的格式，
+    mask是[None, seq_len, 1]的格式，先除去mask部分，
+    然后再做maxpooling。
+    此处处理是将填充值处对应的值处理到极小，即-10^10，这样就几乎不可能对最大池化的结果造成影响
+    """
+    seq, mask = x
+    seq -= (1 - mask) * 1e10
+    return K.max(seq, 1) # maxpooling
+
+# 建立BERT模型，加载权重
+bert_model = load_trained_model_from_checkpoint(config_path, checkpoint_path,  trainable=True)
+#albert_model = build_bert_model(config_path, checkpoint_path, with_mlm=True, albert=True)
+
+for I in bert.model.layers:
+  I.trainable = True
+
+
+x1_in = Input(shape=(None,))  # 待识别句子输入[batch_size, seq_len]
+x3_in =Input(shape=(None,))
+x2_in = Input(shape=(None,))  # 实体语义表达输入 ，描述文本[batch_size, seq_len, 1]
+x4_in =Input(shape=(None,))
+s1_in = Input(shape=(None,))  # 实体左边界（标签）
+s2_in = Input(shape=(None,))  # 实体右边界（标签）
+y_in = Input(shape=(None,))  # 实体标记
+t_in = Input(shape=(1,))  # 是否有关联（标签）
+
+x1, x3, x2, x4, s1, s2, y, t =(x1_in,x3_in, x2_in,x4_in, s1_in, s2_in, y_in, t_in)
+
+x1_mask = Lambda(lambda x: K.cast(K.greater(K.expand_dims(x, 2), 0), 'float32'))(x1)  # 匿名函数 cast 数据转换
+x2_mask = Lambda(lambda x: K.cast(K.greater(K.expand_dims(x, 2), 0), 'float32'))(x2)  # 匿名函数 cast 数据转换   [batch_size, seq_len,  x]
+
+
+
+x1 = bert_model([x1_in,x3_in])
+x1 = Dropout(0.2)(x1)  # #百分之20的神经元不工作
+#x1 = Lambda(lambda x: x[0] * x[1])([x1, x1_mask])  # 逐位对应相乘
+#x1 = Bidirectional(CuDNNLSTM(char_size // 2, return_sequences=True))(x1)  # LSTM
+#x1 = Lambda(lambda x: x[0] * x[1])([x1, x1_mask])  # 逐位对应相乘
+#x1 = Bidirectional(CuDNNLSTM(char_size // 2, return_sequences=True))(x1)  # LSTM
+#x1 = Lambda(lambda x: x[0] * x[1])([x1, x1_mask])  # 逐位对应相乘'''
+
+
+h = Conv1D(char_size, 3, activation='relu', padding='same')(x1)  # 特征压缩融合x1
+ps1 = Dense(1, activation='sigmoid')(h) #预测实体边界
+ps2 = Dense(1, activation='sigmoid')(h) # 预测的实体边界
+
+
+s_model = Model([x1_in,x3_in,x2_in,x4_in], [ps1, ps2]) # 放入model进行训练  第一个起始位置，终止位置预测
+
+
+y = Lambda(lambda x: K.expand_dims(x, 2))(y)  # 实体标记
+x1 = Concatenate()([x1, y]) # 将文本输入x1加上实体标记
+x1 = Conv1D(char_size, 3, padding='same')(x1)  # 特征压缩 才做了一半
+
+
+x2 = bert_model([x2,x4])
+x2 = Dropout(0.2)(x2)
+x2 = Lambda(lambda x: x[0] * x[1])([x2, x2_mask])
+#x2 = Bidirectional(CuDNNLSTM(char_size//2, return_sequences=True))(x2)
+#x2 = Lambda(lambda x: x[0] * x[1])([x2, x2_mask])
+
+
+
+x1 = Lambda(seq_maxpool)([x1, x1_mask]) # 序列最大池化
+x2 = Lambda(seq_maxpool)([x2, x2_mask])  # 序列最大池化
+x12 = Multiply()([x1, x2]) # 将输入文本加上描述文本
+x = Concatenate()([x1, x2, x12]) # 三个一起进行融合
+x = Dense(char_size, activation='relu')(x)
+pt = Dense(1, activation='sigmoid')(x)
+
+
+t_model = Model([x1_in,x3_in,x2_in,x4_in, y_in], pt) # 将其导入模型进行优化  第二个模型
+
+
+model = Model([x1_in,x3_in, x2_in,x4_in,s1_in, s2_in, y_in, t_in], [ps1, ps2, pt])  # 第三个模型
+
+s1 = K.expand_dims(s1, 2)
+s2 = K.expand_dims(s2, 2)
+
+s1_loss = K.binary_crossentropy(s1, ps1) # 左边界的损失函数
+s1_loss = K.sum(s1_loss * x1_mask) / K.sum(x1_mask)
+s2_loss = K.binary_crossentropy(s2, ps2) # 右边界的损失函数
+s2_loss = K.sum(s2_loss * x1_mask) / K.sum(x1_mask)
+pt_loss = K.mean(K.binary_crossentropy(t, pt)) # 标记损失函数
+
+loss = s1_loss + s2_loss + pt_loss
+
+model.add_loss(loss)
+model.compile(optimizer=Adam(1e-5))
+model.summary()
+
+
+
+def extract_items(text_in):  # 提取项目
+    #_x1 = [char2id.get(c, 1) for c in text_in]  #get(key,value)|返回这个键所对应的值,如找不到返回None
+    _x1 = tokenizer.encode(first=text_in)
+    _x1 = np.array([_x1])
+    _k1, _k2 = s_model.predict(_x1)
+    _k1, _k2 = _k1[0, :, 0], _k2[0, :, 0]
+    _k1, _k2 = np.where(_k1 > 0.5)[0], np.where(_k2 > 0.5)[0]  # 满足条件(condition)，输出x，不满足输出y。
+    _subjects = []
+    for i in _k1:
+        j = _k2[_k2 >= i]
+        if len(j) > 0:
+            j = j[0]
+            _subject = text_in[i: j+1]
+            _subjects.append((_subject, i, j))
+    if _subjects:
+        R = []
+        _X2, _Y = [], []  # 描述文本， 实体标记
+        _S, _IDXS = [], {}  # 实体边界，编号
+        for _s in _subjects:
+            _y = np.zeros(len(text_in))
+            _y[_s[1]: _s[2]] = 1
+            _IDXS[_s] = kb2id.get(_s[0], [])
+            for i in _IDXS[_s]:
+                _x2 = id2kb[i]['subject_desc']
+                _x2 = [char2id.get(c, 1) for c in _x2]
+                _X2.append(_x2)
+                _Y.append(_y)
+                _S.append(_s)
+        if _X2:
+            _X2 = seq_padding(_X2)
+            _Y = seq_padding(_Y)
+            _X1 = np.repeat(_x1, len(_X2), 0)
+            scores = t_model.predict([_X1, _X2, _Y])[:, 0]
+            for k, v in groupby(zip(_S, scores), key=lambda s: s[0]):
+                v = np.array([j[1] for j in v])
+                kbid = _IDXS[k][np.argmax(v)]
+                R.append((k[0], k[1], kbid))
+        return R  # 返回值
+    else:
+        return []
+
+
+class Evaluate(Callback): # 评估数据
+    def __init__(self):
+        self.F1 = []
+        self.best = 0.
+    def on_epoch_end(self, epoch, logs=None):
+        f1, precision, recall = self.evaluate()
+        self.F1.append(f1)
+        if f1 > self.best:
+            self.best = f1
+            train_model.save_weights('best_model.weights')
+        print('f1: %.4f, precision: %.4f, recall: %.4f, best f1: %.4f\n' % (f1, precision, recall, self.best))
+    def evaluate(self):
+        A, B, C = 1e-10, 1e-10, 1e-10
+        for d in tqdm(iter(dev_data)):  # 在验证机上的测试
+            R = set(extract_items(d['text'])) # extact 方法提取 提及边界，进行判断
+            print('R is',R)
+            T = set(d['mention_data']) # 测试值
+            A += len(R & T)
+            B += len(R)
+            C += len(T)
+        print('R is', R)
+        return 2 * A / (B + C), A / B, A / C  # precision  recall best f1
+
+
+evaluator = Evaluate() # 生成相关的标准
+#print('R is',evaluator.evaluate.R)
+#print('evaluator is',evaluator)
+for d in tqdm(iter(dev_data)):
+    print('iter(dev_data) is ',iter(dev_data))
+    print('d[text] is ',d['text'])
+
+train_D = data_generator(train_data)# 生成相关特征
+valid_D = data_generator(dev_data)
+print("train_D is",train_D)
+
+# model 是最终的关键
+model.fit_generator(train_D.__iter__(), steps_per_epoch=len(train_D), epochs=60, callbacks=[evaluator])
+# 数据增强
